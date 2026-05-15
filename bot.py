@@ -32,6 +32,8 @@ DB_PATH = "messages.db"
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+
+        # 管理员消息ID -> 用户chat_id
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS message_map (
                 admin_message_id INTEGER PRIMARY KEY,
@@ -39,6 +41,35 @@ def init_db():
                 created_at INTEGER NOT NULL
             )
         """)
+
+        # 已处理的用户消息，防止重复转发
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+        """)
+
+        # 配置项
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+        # 默认配置
+        cursor.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+            ("rate_limit_seconds", "3")
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+            ("history_days", "7")
+        )
+
         conn.commit()
 
 def save_mapping(admin_message_id: int, user_chat_id: int):
@@ -60,62 +91,202 @@ def get_mapping(admin_message_id: int):
         row = cursor.fetchone()
         return row[0] if row else None
 
+def is_processed(chat_id: int, message_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM processed_messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id)
+        )
+        return cursor.fetchone() is not None
+
+def mark_processed(chat_id: int, message_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO processed_messages (chat_id, message_id, created_at) VALUES (?, ?, ?)",
+            (chat_id, message_id, int(time.time()))
+        )
+        conn.commit()
+
+def clear_history():
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM message_map")
+        cursor.execute("DELETE FROM processed_messages")
+        conn.commit()
+
+def get_config_int(key: str, default: int) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        if not row:
+            return default
+        try:
+            return int(row[0])
+        except ValueError:
+            return default
+
+def set_config_int(key: str, value: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            (key, str(value))
+        )
+        conn.commit()
+
 def cleanup_old_messages():
-    expire_time = int(time.time()) - (7 * 24 * 60 * 60)
+    history_days = get_config_int("history_days", 7)
+    expire_time = int(time.time()) - (history_days * 24 * 60 * 60)
+
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "DELETE FROM message_map WHERE created_at < ?",
             (expire_time,)
         )
+        cursor.execute(
+            "DELETE FROM processed_messages WHERE created_at < ?",
+            (expire_time,)
+        )
         conn.commit()
 
-# 启动时清理一次
 init_db()
 cleanup_old_messages()
 
 # =========================
 # 防刷屏
 # =========================
-rate_limit = {}
-RATE_LIMIT_SECONDS = 3
+rate_limit_cache = {}
+RATE_LIMIT_SECONDS = get_config_int("rate_limit_seconds", 3)
+
+# =========================
+# 工具函数
+# =========================
+def is_admin(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
+
+def should_rate_limit(chat_id: int) -> bool:
+    now = time.time()
+    last_time = rate_limit_cache.get(chat_id, 0)
+
+    if now - last_time < RATE_LIMIT_SECONDS:
+        return True
+
+    rate_limit_cache[chat_id] = now
+    return False
 
 # =========================
 # /test
 # =========================
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user:
+    if not is_admin(update):
         return
-
-    if update.effective_user.id != ADMIN_ID:
-        return
-
     await update.message.reply_text("机器人在线")
 
 # =========================
 # /status
 # =========================
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user:
-        return
-
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update):
         return
 
     cleanup_old_messages()
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+
         cursor.execute("SELECT COUNT(*) FROM message_map")
-        total = cursor.fetchone()[0]
+        total_map = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM processed_messages")
+        total_processed = cursor.fetchone()[0]
 
     text = (
         "机器人状态正常\n\n"
         f"管理员ID: {ADMIN_ID}\n"
-        f"已保存消息映射: {total}\n"
-        f"防刷屏间隔: {RATE_LIMIT_SECONDS} 秒"
+        f"已保存消息映射: {total_map}\n"
+        f"已记录去重消息: {total_processed}\n"
+        f"防刷屏间隔: {RATE_LIMIT_SECONDS} 秒\n"
+        f"历史保留: {get_config_int('history_days', 7)} 天"
     )
     await update.message.reply_text(text)
+
+# =========================
+# /clearhistory
+# =========================
+async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    clear_history()
+    rate_limit_cache.clear()
+    await update.message.reply_text("历史消息记录已清空。")
+
+# =========================
+# /setratelimit <秒数>
+# =========================
+async def set_ratelimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global RATE_LIMIT_SECONDS
+
+    if not is_admin(update):
+        return
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("用法：/setratelimit 3")
+        return
+
+    try:
+        seconds = int(context.args[0])
+
+        if seconds < 0:
+            await update.message.reply_text("防刷屏时间不能小于 0。")
+            return
+
+        if seconds > 3600:
+            await update.message.reply_text("防刷屏时间过大，建议不要超过 3600 秒。")
+            return
+
+        RATE_LIMIT_SECONDS = seconds
+        set_config_int("rate_limit_seconds", seconds)
+        rate_limit_cache.clear()
+
+        await update.message.reply_text(f"防刷屏时间已设置为 {seconds} 秒。")
+
+    except ValueError:
+        await update.message.reply_text("请输入有效数字，例如：/setratelimit 5")
+
+# =========================
+# /sethistorydays <天数>
+# =========================
+async def set_history_days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("用法：/sethistorydays 7")
+        return
+
+    try:
+        days = int(context.args[0])
+
+        if days < 1:
+            await update.message.reply_text("保留天数不能小于 1。")
+            return
+
+        if days > 365:
+            await update.message.reply_text("保留天数过大，建议不要超过 365。")
+            return
+
+        set_config_int("history_days", days)
+        cleanup_old_messages()
+
+        await update.message.reply_text(f"历史保留天数已设置为 {days} 天。")
+
+    except ValueError:
+        await update.message.reply_text("请输入有效数字，例如：/sethistorydays 7")
 
 # =========================
 # 主消息处理
@@ -125,12 +296,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # ==================================================
+    # =========================
     # 管理员消息
-    # ==================================================
+    # =========================
     if msg.chat_id == ADMIN_ID:
-
-        # 管理员必须回复机器人转发过来的消息
         if not msg.reply_to_message:
             await msg.reply_text("请先回复一条机器人转发过来的消息，再发送内容。")
             return
@@ -139,7 +308,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_user = get_mapping(replied_message_id)
 
         if not target_user:
-            await msg.reply_text("找不到对应用户。可能是消息过旧、机器人重启过，或者这条不是机器人转发的消息。")
+            await msg.reply_text(
+                "找不到对应用户。可能是消息过旧、机器人重启过，或者这条不是机器人转发的消息。"
+            )
             return
 
         try:
@@ -215,17 +386,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # ==================================================
+    # =========================
     # 普通用户消息
-    # ==================================================
-    now = time.time()
-    last_time = rate_limit.get(msg.chat_id, 0)
-
-    if now - last_time < RATE_LIMIT_SECONDS:
+    # =========================
+    if should_rate_limit(msg.chat_id):
         await msg.reply_text("发送太快了，请稍后再试。")
         return
 
-    rate_limit[msg.chat_id] = now
+    # 去重：同一用户同一条消息只处理一次
+    if is_processed(msg.chat_id, msg.message_id):
+        return
+
+    mark_processed(msg.chat_id, msg.message_id)
 
     try:
         forwarded = await context.bot.forward_message(
@@ -249,6 +421,9 @@ def main():
 
     app.add_handler(CommandHandler("test", test_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("clearhistory", clear_history_command))
+    app.add_handler(CommandHandler("setratelimit", set_ratelimit_command))
+    app.add_handler(CommandHandler("sethistorydays", set_history_days_command))
 
     app.add_handler(
         MessageHandler(
