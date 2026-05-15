@@ -14,15 +14,15 @@ from telegram.ext import (
 # 环境变量
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
+ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN:
     raise Exception("BOT_TOKEN 没设置")
 
-if not ADMIN_ID:
+if not ADMIN_ID_RAW:
     raise Exception("ADMIN_ID 没设置")
 
-ADMIN_ID = int(ADMIN_ID)
+ADMIN_ID = int(ADMIN_ID_RAW.strip())
 
 # =========================
 # SQLite
@@ -153,6 +153,7 @@ def cleanup_old_messages():
         )
         conn.commit()
 
+# 启动时初始化并清理一次
 init_db()
 cleanup_old_messages()
 
@@ -162,9 +163,6 @@ cleanup_old_messages()
 rate_limit_cache = {}
 RATE_LIMIT_SECONDS = get_config_int("rate_limit_seconds", 3)
 
-# =========================
-# 工具函数
-# =========================
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
@@ -234,8 +232,16 @@ async def set_ratelimit_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(update):
         return
 
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("用法：/setratelimit 3")
+    if not context.args:
+        await update.message.reply_text(
+            "用法：/setratelimit 3\n请在命令后面加上秒数。"
+        )
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "用法：/setratelimit 3\n只能填写一个数字。"
+        )
         return
 
     try:
@@ -265,8 +271,16 @@ async def set_history_days_command(update: Update, context: ContextTypes.DEFAULT
     if not is_admin(update):
         return
 
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("用法：/sethistorydays 7")
+    if not context.args:
+        await update.message.reply_text(
+            "用法：/sethistorydays 7\n请在命令后面加上天数。"
+        )
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "用法：/sethistorydays 7\n只能填写一个数字。"
+        )
         return
 
     try:
@@ -296,10 +310,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
+    cleanup_old_messages()
+
     # =========================
     # 管理员消息
     # =========================
     if msg.chat_id == ADMIN_ID:
+
         if not msg.reply_to_message:
             await msg.reply_text("请先回复一条机器人转发过来的消息，再发送内容。")
             return
@@ -393,11 +410,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("发送太快了，请稍后再试。")
         return
 
-    # 去重：同一用户同一条消息只处理一次
+    # 去重：同一用户同一条消息只记录一次
     if is_processed(msg.chat_id, msg.message_id):
         return
-
-    mark_processed(msg.chat_id, msg.message_id)
 
     try:
         forwarded = await context.bot.forward_message(
@@ -407,6 +422,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         save_mapping(forwarded.message_id, msg.chat_id)
+        mark_processed(msg.chat_id, msg.message_id)
 
         await msg.reply_text("已收到，我会转发给管理员。")
 
