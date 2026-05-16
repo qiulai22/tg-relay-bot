@@ -1,6 +1,7 @@
 import os
 import time
 import sqlite3
+import re
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -163,6 +164,12 @@ cleanup_old_messages()
 rate_limit_cache = {}
 RATE_LIMIT_SECONDS = get_config_int("rate_limit_seconds", 3)
 
+# =========================
+# 管理员交互状态
+# =========================
+# None / "setratelimit" / "sethistorydays"
+pending_admin_action = None
+
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
@@ -175,6 +182,9 @@ def should_rate_limit(chat_id: int) -> bool:
 
     rate_limit_cache[chat_id] = now
     return False
+
+def is_pure_digits(text: str) -> bool:
+    return bool(re.fullmatch(r"[0-9]+", text.strip()))
 
 # =========================
 # /test
@@ -202,13 +212,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("SELECT COUNT(*) FROM processed_messages")
         total_processed = cursor.fetchone()[0]
 
+    pending_text = "无"
+    if pending_admin_action == "setratelimit":
+        pending_text = "等待设置防刷屏时间"
+    elif pending_admin_action == "sethistorydays":
+        pending_text = "等待设置历史保留天数"
+
     text = (
         "机器人状态正常\n\n"
         f"管理员ID: {ADMIN_ID}\n"
         f"已保存消息映射: {total_map}\n"
         f"已记录去重消息: {total_processed}\n"
         f"防刷屏间隔: {RATE_LIMIT_SECONDS} 秒\n"
-        f"历史保留: {get_config_int('history_days', 7)} 天"
+        f"历史保留: {get_config_int('history_days', 7)} 天\n"
+        f"当前等待输入: {pending_text}"
     )
     await update.message.reply_text(text)
 
@@ -224,88 +241,38 @@ async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("历史消息记录已清空。")
 
 # =========================
-# /setratelimit <秒数>
+# /setratelimit
+# 先发命令，再发下一条消息作为数字
 # =========================
 async def set_ratelimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global RATE_LIMIT_SECONDS
+    global pending_admin_action
 
     if not is_admin(update):
         return
 
-    if not context.args:
-        await update.message.reply_text(
-            "用法：/setratelimit 3\n请在命令后面加上秒数。"
-        )
-        return
-
-    if len(context.args) != 1:
-        await update.message.reply_text(
-            "用法：/setratelimit 3\n只能填写一个数字。"
-        )
-        return
-
-    try:
-        seconds = int(context.args[0])
-
-        if seconds < 0:
-            await update.message.reply_text("防刷屏时间不能小于 0。")
-            return
-
-        if seconds > 3600:
-            await update.message.reply_text("防刷屏时间过大，建议不要超过 3600 秒。")
-            return
-
-        RATE_LIMIT_SECONDS = seconds
-        set_config_int("rate_limit_seconds", seconds)
-        rate_limit_cache.clear()
-
-        await update.message.reply_text(f"防刷屏时间已设置为 {seconds} 秒。")
-
-    except ValueError:
-        await update.message.reply_text("请输入有效数字，例如：/setratelimit 5")
+    pending_admin_action = "setratelimit"
+    await update.message.reply_text("请发送要设置的防刷屏时间（纯数字，单位：秒）。")
 
 # =========================
-# /sethistorydays <天数>
+# /sethistorydays
+# 先发命令，再发下一条消息作为数字
 # =========================
 async def set_history_days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global pending_admin_action
+
     if not is_admin(update):
         return
 
-    if not context.args:
-        await update.message.reply_text(
-            "用法：/sethistorydays 7\n请在命令后面加上天数。"
-        )
-        return
-
-    if len(context.args) != 1:
-        await update.message.reply_text(
-            "用法：/sethistorydays 7\n只能填写一个数字。"
-        )
-        return
-
-    try:
-        days = int(context.args[0])
-
-        if days < 1:
-            await update.message.reply_text("保留天数不能小于 1。")
-            return
-
-        if days > 365:
-            await update.message.reply_text("保留天数过大，建议不要超过 365。")
-            return
-
-        set_config_int("history_days", days)
-        cleanup_old_messages()
-
-        await update.message.reply_text(f"历史保留天数已设置为 {days} 天。")
-
-    except ValueError:
-        await update.message.reply_text("请输入有效数字，例如：/sethistorydays 7")
+    pending_admin_action = "sethistorydays"
+    await update.message.reply_text("请发送要设置的历史保留天数（纯数字）。")
 
 # =========================
 # 主消息处理
 # =========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global pending_admin_action
+    global RATE_LIMIT_SECONDS
+
     msg = update.message
     if not msg:
         return
@@ -317,6 +284,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # =========================
     if msg.chat_id == ADMIN_ID:
 
+        # 先处理“等待设置参数”的情况
+        if pending_admin_action in ("setratelimit", "sethistorydays"):
+            if not msg.text:
+                await msg.reply_text("请发送纯数字。")
+                return
+
+            value_text = msg.text.strip()
+
+            if not is_pure_digits(value_text):
+                await msg.reply_text("输入必须是纯数字，不能包含文字、字母或符号。")
+                return
+
+            value = int(value_text)
+
+            if pending_admin_action == "setratelimit":
+                if value > 3600:
+                    await msg.reply_text("防刷屏时间过大，建议不要超过 3600 秒。")
+                    return
+
+                RATE_LIMIT_SECONDS = value
+                set_config_int("rate_limit_seconds", value)
+                rate_limit_cache.clear()
+                pending_admin_action = None
+                await msg.reply_text(f"防刷屏时间已设置为 {value} 秒。")
+                return
+
+            if pending_admin_action == "sethistorydays":
+                if value < 1:
+                    await msg.reply_text("保留天数不能小于 1。")
+                    return
+
+                if value > 365:
+                    await msg.reply_text("保留天数过大，建议不要超过 365。")
+                    return
+
+                set_config_int("history_days", value)
+                cleanup_old_messages()
+                pending_admin_action = None
+                await msg.reply_text(f"历史保留天数已设置为 {value} 天。")
+                return
+
+        # 正常管理员回复用户
         if not msg.reply_to_message:
             await msg.reply_text("请先回复一条机器人转发过来的消息，再发送内容。")
             return
